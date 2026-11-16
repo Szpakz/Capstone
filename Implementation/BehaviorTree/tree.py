@@ -42,8 +42,8 @@ class Current:
     cruise_alt: float = 5.0  # Cruise altitude
     takeoff_altitude_tolerance: float = 0.5  # Tolerance for takeoff altitude
 
-    waypoint_radius: float = 0.6  # radius around waypoint for it to be "reached"
-    home_radius: float = 0.25  # radius around home for it to be "reached"
+    waypoint_radius: float = 0.5  # radius around waypoint for it to be "reached"
+    home_radius: float = 0.15  # radius around home for it to be "reached"
 
     # Battery level threshold for low battery warning
     battery_low_threshold: float = 0.2

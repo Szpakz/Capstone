@@ -1,9 +1,63 @@
 import asyncio
-from config import DEBUG_TREE, SYSTEM_ADDRESS, TICK_HZ
+import math
+from config import DEBUG_TREE, SYSTEM_ADDRESS, TICK_HZ, MAX_SPEED, MAX_ACCELERATION
+from dataclasses import dataclass
 from mavsdk_grpc import System
 from mavsdk_grpc.offboard import PositionNedYaw, VelocityNedYaw, OffboardError
 
 from BehaviorTree.tree import Command, Current, build_tree, print_tree
+
+
+@dataclass
+class SmoothMovement:
+    # Smooth outgoing movement parameters for the drone
+    current: Current
+    max_speed: float = MAX_SPEED
+    max_acceleration: float = MAX_ACCELERATION
+
+    north: float = 0.0
+    east: float = 0.0
+
+    velocity_north: float = 0.0
+    velocity_east: float = 0.0
+
+    def __post_init__(self):
+        self.north = self.current.north
+        self.east = self.current.east
+
+    def update(self, target_north: float, target_east: float, target_down: float, yaw, dt):
+        desired_north = target_north - self.north
+        desired_east = target_east - self.east
+        dist = math.hypot(desired_north, desired_east)
+
+        if dist > 0.01:
+            speed = min(self.max_speed, math.sqrt(
+                2 * self.max_acceleration * dist))
+            desired_velocity_north = (desired_north / dist) * speed
+            desired_velocity_east = (desired_east / dist) * speed
+        else:
+            desired_velocity_north = 0.0
+            desired_velocity_east = 0.0
+
+        # limit accel
+        delta_v_north = desired_velocity_north - self.velocity_north
+        delta_v_east = desired_velocity_east - self.velocity_east
+
+        change = math.hypot(delta_v_north, delta_v_east)
+        max_change = self.max_acceleration * dt
+        if change > max_change:
+            scale = max_change / change
+            delta_v_north *= scale
+            delta_v_east *= scale
+
+        self.velocity_north += delta_v_north
+        self.velocity_east += delta_v_east
+
+        # update commanded position
+        self.north += self.velocity_north * dt
+        self.east += self.velocity_east * dt
+
+        return PositionNedYaw(self.north, self.east, target_down, yaw)
 
 # ------------------------------------------- Current State
 
@@ -31,13 +85,17 @@ async def current_battery(drone: System, current: Current):
 # ------------------------------------------- Drone Movement
 
 
-async def drone_action(drone: System, current: Current, cmd: Command):
+async def drone_action(drone: System, current: Current, cmd: Command, movement: SmoothMovement):
     if cmd.command_type == "takeoff":
         # drone is in offboard mode, so we can just set the position to the cruise altitude
-        await drone.offboard.set_position_ned(PositionNedYaw(current.north, current.east, -current.cruise_alt, current.yaw))
+        target = movement.update(
+            current.north, current.east, -current.cruise_alt, current.yaw, 1.0 / TICK_HZ)
+        await drone.offboard.set_position_ned(target)
 
     elif cmd.command_type == "position":
-        await drone.offboard.set_position_ned(PositionNedYaw(cmd.north, cmd.east, cmd.down, cmd.yaw))
+        target = movement.update(
+            cmd.north, cmd.east, cmd.down, cmd.yaw, 1.0 / TICK_HZ)
+        await drone.offboard.set_position_ned(target)
 
     elif cmd.command_type == "velocity":
         await drone.offboard.set_velocity_ned(VelocityNedYaw(cmd.velocity_north, cmd.velocity_east, cmd.velocity_down, cmd.velocity_yaw))
@@ -53,7 +111,9 @@ async def drone_action(drone: System, current: Current, cmd: Command):
         pass
 
     elif cmd.command_type == "return_home":
-        await drone.offboard.set_position_ned(PositionNedYaw(0, 0, -current.cruise_alt, current.yaw))
+        target = movement.update(
+            0, 0, -current.cruise_alt, current.yaw, 1.0 / TICK_HZ)
+        await drone.offboard.set_position_ned(target)
 
     else:
         print(f"Unknown command type: {cmd.command_type}, Defaulting to hover")
@@ -87,6 +147,8 @@ async def main():
 
     current = Current()
     tree = build_tree(current)
+
+    movement = SmoothMovement(current)
 
     tasks = [
         asyncio.create_task(current_position(drone, current)),
@@ -125,7 +187,7 @@ async def main():
                 print_tree(tree)
             tick_count += 1
 
-            if await drone_action(drone, current, current.command):
+            if await drone_action(drone, current, current.command, movement):
                 landed = True
                 break
             await asyncio.sleep(1.0 / TICK_HZ)
